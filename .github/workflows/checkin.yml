@@ -11,10 +11,14 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checkin:
-    # 钉在 24.04：26.04 新镜像存在 ubuntu 源 DNS 解析故障
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     environment: production
     env:
       PYTHONIOENCODING: utf-8
@@ -41,17 +45,18 @@ jobs:
           ${{ runner.os }}-uv-
 
     - name: 安装依赖
+      timeout-minutes: 5
       run: |
         uv sync --frozen
         echo "✅ 环境初始化完成"
 
-    - name: 安装系统依赖
-      # runner 偶发 DNS 故障不阻断签到；xvfb 等核心依赖已内置，字体缺失仅影响渲染
-      continue-on-error: true
+    - name: 检查系统依赖
+      # 使用运行器预装的 Xvfb，避免软件源故障阻塞签到。
       run: |
-        sudo apt-get update
-        sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
-          fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+        command -v xvfb-run
+        command -v Xvfb
+        command -v xauth
+        echo "✅ 系统依赖检查完成"
 
     - name: 缓存 CloakBrowser 二进制
       uses: actions/cache@v5
@@ -63,6 +68,7 @@ jobs:
           ${{ runner.os }}-cloakbrowser-
 
     - name: 安装 CloakBrowser
+      timeout-minutes: 5
       run: |
         uv run python -m cloakbrowser install
         echo "✅ CloakBrowser 安装完成"
@@ -85,6 +91,7 @@ jobs:
           browser-profiles-${{ runner.os }}-
 
     - name: 配置代理
+      timeout-minutes: 5
       env:
         CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
         PROXY_SUBSCRIPTION_URL: ${{ secrets.PROXY_SUBSCRIPTION_URL }}
@@ -103,6 +110,7 @@ jobs:
         sleep $JITTER
 
     - name: 执行签到
+      timeout-minutes: 20
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
         CHECKIN_HEADLESS: false
