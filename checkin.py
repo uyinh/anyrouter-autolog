@@ -8,8 +8,9 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -175,7 +176,7 @@ async def login_with_credentials(
 		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
-		return None
+		return BrowserLoginResult(cookies={}, error='浏览器启动失败')
 
 	page = None
 	try:
@@ -216,11 +217,11 @@ async def login_with_credentials(
 			debug_print(f'[INFO] {account_name}: Got cookies: {cookie_names}')
 			await save_login_screenshot(page, provider_name, account_name, 'not-authenticated')
 			await context.close()
-			return None
+			return BrowserLoginResult(cookies={}, error='登录后用户信息校验未通过')
 
 		cookies = await context.cookies()
 		all_cookies = {
-			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
+			cookie['name']: cookie['value'] for cookie in cookies if cookie.get('name') and cookie.get('value')
 		}
 		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
 
@@ -232,11 +233,12 @@ async def login_with_credentials(
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, fresh_login=fresh_login)
 
 	except Exception as e:
-		print(f'[FAILED] {account_name}: Error during login: {e}')
+		error = summarize_failure_reason(e, sensitive_values=(email, password))
+		print(f'[FAILED] {account_name}: {error}')
 		if page is not None:
 			await save_login_screenshot(page, provider_name, account_name, 'login-error')
 		await context.close()
-		return None
+		return BrowserLoginResult(cookies={}, error=error)
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -256,9 +258,10 @@ def get_user_info(client, headers, user_info_url: str):
 					'used_quota': used_quota,
 					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
 				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+			return {'success': False, 'error': data.get('message') or '用户信息请求被拒绝'}
+		return {'success': False, 'error': f'用户信息接口返回 HTTP {response.status_code}'}
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		return {'success': False, 'error': f'用户信息查询失败：{summarize_failure_reason(e)}'}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -297,61 +300,82 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 	if response.status_code == 200:
 		try:
 			result = response.json()
+			if not isinstance(result, dict):
+				return False, '签到接口响应格式异常'
 			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
 				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
+				return True, 'checkin_completed'
 			else:
-				error_msg = result.get('msg', result.get('message', 'Unknown error'))
+				error_msg = result.get('msg') or result.get('message') or '签到接口未说明失败原因'
 				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
 				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
 					print(f'[SUCCESS] {account_name}: Already checked in today')
-					return True
+					return True, 'already_checked_in'
 				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False
+				return False, str(error_msg)
 		except json.JSONDecodeError:
-			if 'success' in response.text.lower():
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False
+			return False, '签到接口返回了非 JSON 响应'
 	else:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-		return False
+		return False, f'签到接口返回 HTTP {response.status_code}'
+
+
+def summarize_failure_reason(error: Exception | str, *, sensitive_values: tuple[str, ...] = ()) -> str:
+	"""保留可处理的错误原因，隐藏请求地址和响应正文。"""
+	message = str(error)
+	for value in sensitive_values:
+		if value:
+			message = message.replace(value, '***')
+	if 'Login page never rendered' in message:
+		return '登录页面未加载完成'
+	if any(text in message for text in ('Cannot find', 'Cannot open email login form')):
+		return '登录表单未就绪'
+	if isinstance(error, (httpx.TimeoutException, TimeoutError)) or 'Timeout' in message:
+		return '请求或页面等待超时'
+	if isinstance(error, httpx.TransportError) or 'net::ERR_' in message:
+		return '网络连接失败'
+	for provider in ('GitHub', 'LinuxDo'):
+		if f'未能从 {provider} 获取授权码' in message:
+			return f'{provider} 授权失败'
+	message = re.sub(r'https?://\S+', '[地址]', message)
+	return re.sub(r'\s+', ' ', message).strip()[:100] or '未返回失败原因'
 
 
 def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息"""
+	"""每个账号一行，仅根据接口结果说明登录、签到和余额。"""
+	name = detail['name']
+	if not detail['success']:
+		return f'❌ {name}：{summarize_failure_reason(detail["error"])}'
+	after = detail['after'] or {}
+	status = after.get('checkin_status', 'completed')
+	labels = {
+		'login_verified': '登录已验证',
+		'checkin_completed': '签到完成',
+		'already_checked_in': '今日已签到',
+		'reward_received': '服务端已发奖',
+		'balance_verified': '余额已查询',
+		'completed': '处理完成',
+	}
+	parts = [f'✅ {name}：{labels[status]}']
+	if after.get('success'):
+		parts.append(f'余额 ${after["quota"]:.2f}')
+		before = detail['before']
+		if before and before.get('success'):
+			quota_change = round(after['quota'] + after['used_quota'] - before['quota'] - before['used_quota'], 2)
+			if quota_change:
+				label = '奖励' if status == 'reward_received' and quota_change > 0 else '总额度变化'
+				parts.append(f'{label} {quota_change:+.2f} 美元')
+	return ' · '.join(parts)
+
+
+def format_check_in_report(results: list[dict], execution_time: datetime | None = None) -> str:
+	success_count = sum(result['success'] for result in results)
+	execution_time = (execution_time or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=8)))
 	lines = [
-		f'[CHECK-IN] {detail["name"]}',
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
+		f'执行结果：{success_count}/{len(results)} 通过，{len(results) - success_count} 失败',
+		execution_time.strftime('%Y-%m-%d %H:%M（北京时间）'),
 	]
-
-	has_reward = detail['check_in_reward'] != 0
-	has_usage = detail['usage_increase'] != 0
-
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		if not has_reward and has_usage:
-			lines.append('  今日已签到（期间有使用）')
-
-		if has_reward:
-			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
-
-		if has_usage:
-			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
-
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
-	else:
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
-
+	lines.extend(format_check_in_notification(result) for result in sorted(results, key=lambda item: item['success']))
 	return '\n'.join(lines)
 
 
@@ -363,7 +387,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None, None
+		return False, None, {'success': False, 'error': '服务商配置不存在'}
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
@@ -382,31 +406,32 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			account.email,
 			account.password,
 		)
-		if login_result:
+		if login_result and not login_result.error:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			fresh_login = login_result.fresh_login
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
-			return False, None, None
+			error = login_result.error if login_result else '邮箱密码登录失败'
+			return False, None, {'success': False, 'error': error}
 	elif account.provider == 'agentrouter' and account.has_oauth_session():
 		print(f'[INFO] {account_name}: Attempting OAuth silent re-login for AgentRouter...')
 		user_cookies = parse_cookies(account.cookies)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		if not all_cookies:
-			return False, None, None
+			return False, None, {'success': False, 'error': '无法获取站点验证 Cookie'}
 		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
-			return False, None, None
+			return False, None, {'success': False, 'error': '账号 Cookie 配置为空或格式错误'}
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
-		return False, None, None
+		return False, None, {'success': False, 'error': '无法获取有效登录会话'}
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
@@ -474,7 +499,7 @@ async def run_agentrouter_oauth_checkin(
 				)
 			else:
 				print(f'[FAILED] {account_name}: Missing OAuth session token')
-				return False, user_info_before, user_info_before
+				return False, user_info_before, {'success': False, 'error': '缺少 OAuth 会话'}
 
 			# 3. 回调登录发奖
 			success, user_data, checked_in, msg = oauth_client.callback_login(
@@ -486,7 +511,7 @@ async def run_agentrouter_oauth_checkin(
 
 			if not success:
 				print(f'[FAILED] {account_name}: OAuth login callback failed - {msg}')
-				return False, user_info_before, user_info_before
+				return False, user_info_before, {'success': False, 'error': f'OAuth 登录失败：{msg}'}
 
 			uid = str(user_data.get('id') or '')
 			if uid:
@@ -497,13 +522,15 @@ async def run_agentrouter_oauth_checkin(
 			if checked_in:
 				print(f'[SUCCESS] {account_name}: OAuth check-in successful! Reward added to balance.')
 			else:
-				print(f'[INFO] {account_name}: OAuth login succeeded, already checked in today.')
+				print(f'[INFO] {account_name}: OAuth 登录已完成')
 
-			return True, user_info_before, user_info_after
+			status = 'reward_received' if checked_in else 'login_verified'
+			return True, user_info_before, {**user_info_after, 'checkin_status': status}
 
 	except Exception as e:
-		print(f'[FAILED] {account_name}: OAuth check-in error: {e}')
-		return False, None, None
+		error = summarize_failure_reason(e)
+		print(f'[FAILED] {account_name}: OAuth check-in error: {error}')
+		return False, None, {'success': False, 'error': error}
 
 
 def run_check_in_requests(
@@ -544,15 +571,17 @@ def run_check_in_requests(
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
+				success, status = execute_check_in(client, account_name, provider_config, headers)
+				if not success:
+					return False, user_info_before, {'success': False, 'error': status}
 				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
+				return True, user_info_before, {**user_info_after, 'checkin_status': status}
 
 			if provider_config.name == 'agentrouter':
 				if fresh_login:
 					if user_info_before and user_info_before.get('success'):
 						print(f'[SUCCESS] {account_name}: AgentRouter 邮箱密码重新登录完成，已验证用户信息')
-						return True, user_info_before, user_info_before
+						return True, None, {**user_info_before, 'checkin_status': 'login_verified'}
 					print(f'[FAILED] {account_name}: AgentRouter 重新登录后无法验证用户信息')
 					return False, user_info_before, user_info_before
 				print(
@@ -560,19 +589,20 @@ def run_check_in_requests(
 				)
 				print(f'[WARN] {account_name}: 当前仅提供了静态 Session Cookie，未触发登录事件，额度不会增长。')
 				print(f'[HINT] {account_name}: 请配置邮箱密码或 OAuth 会话，并使用新的登录会话执行签到。')
-				return False, user_info_before, user_info_before
+				return False, user_info_before, {'success': False, 'error': '需要重新登录，当前复用了旧会话'}
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return True, user_info_before, user_info_after
+				print(f'[INFO] {account_name}: 用户信息查询成功')
+				return True, user_info_before, {**user_info_after, 'checkin_status': 'balance_verified'}
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
 			return False, user_info_before, user_info_after
 
 	except Exception as e:
-		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-		return False, None, None
+		error = summarize_failure_reason(e)
+		print(f'[FAILED] {account_name}: {error}')
+		return False, None, {'success': False, 'error': error}
 
 
 async def main():
@@ -606,142 +636,47 @@ async def main():
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
 	last_balance_hash = load_balance_hash()
-
-	success_count = 0
-	total_count = len(accounts)
-	notification_content = []
+	results = []
 	current_balances = {}
-	account_check_in_details = {}
-	need_notify = False
-	balance_changed = False
 
 	for i, account in enumerate(accounts):
-		account_key = f'account_{i + 1}'
 		if i > 0:
-			jitter_secs = random.randint(5, 18)
+			jitter_secs = random.randint(5, 18)  # nosec B311：仅用于执行间隔
 			print(f'[INFO] Account jitter: waiting {jitter_secs}s before next account...')
 			await asyncio.sleep(jitter_secs)
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
-			if success:
-				success_count += 1
+			success, before, after = await check_in_account(account, i, app_config)
+			error = (after or {}).get('error') or (before or {}).get('error') or '未返回失败原因'
+		except Exception as exc:
+			success, before, after = False, None, None
+			error = summarize_failure_reason(exc)
+		results.append(
+			{'name': account.get_display_name(i), 'success': success, 'before': before, 'after': after, 'error': error}
+		)
+		if after and after.get('success'):
+			current_balances[f'account_{i + 1}'] = {'quota': after['quota'], 'used': after['used_quota']}
 
-			should_notify_this_account = False
-
-			if not success:
-				should_notify_this_account = True
-				need_notify = True
-				account_name = account.get_display_name(i)
-				print(f'[NOTIFY] {account_name} failed, will send notification')
-
-			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'success': success,
-					}
-
-			if should_notify_this_account:
-				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
-
-		except Exception as e:
-			account_name = account.get_display_name(i)
-			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
-
+	success_count = sum(result['success'] for result in results)
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
-	if current_balance_hash:
-		if last_balance_hash is None:
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] First run detected, will send notification with current balances')
-		elif current_balance_hash != last_balance_hash:
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] Balance changes detected, will send notification')
-		else:
-			print('[INFO] No balance changes detected')
-
-	if balance_changed:
-		for i, account in enumerate(accounts):
-			account_key = f'account_{i + 1}'
-			if account_key in account_check_in_details:
-				detail = account_check_in_details[account_key]
-				account_name = detail['name']
-				account_result = format_check_in_notification(detail)
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
-
+	balance_changed = current_balance_hash is not None and current_balance_hash != last_balance_hash
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
-	if need_notify and notification_content:
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
-
-		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
-		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
-		else:
-			summary.append('[ERROR] All accounts check-in failed')
-
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+	if success_count < len(accounts) or balance_changed:
+		notify_content = format_check_in_report(results)
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
+			notify_content += f'\n调试截图：{len(screenshot_paths)} 张'
 			github_run_id = os.getenv('GITHUB_RUN_ID', '').strip()
 			github_repo = os.getenv('GITHUB_REPOSITORY', '').strip()
-			screenshot_hint = f'[SCREENSHOT] {len(screenshot_paths)} debug screenshot(s) saved'
 			if github_run_id and github_repo:
-				run_url = f'https://github.com/{github_repo}/actions/runs/{github_run_id}'
-				screenshot_hint += f'. Download artifact `checkin-screenshots-{github_run_id}` from: {run_url}'
-			else:
-				screenshot_hint += ' to `checkin_screenshots/`'
-			notify_content += f'\n\n{screenshot_hint}'
-
+				notify_content += f'\nhttps://github.com/{github_repo}/actions/runs/{github_run_id}'
 		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
-		print('[NOTIFY] Notification sent due to failures or balance changes')
+		notify.push_message('AnyRouter 执行结果', notify_content, msg_type='text')
 	else:
-		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+		print(f'[INFO] {success_count}/{len(accounts)} 个账号处理通过，余额无变化，跳过通知')
 
-	sys.exit(0 if success_count > 0 else 1)
+	sys.exit(0 if success_count == len(accounts) else 1)
 
 
 def run_main():

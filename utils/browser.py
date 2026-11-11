@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from utils.debug import debug_print, is_debug_enabled
 from utils.popups import dismiss_popups, setup_popup_guard
@@ -144,6 +144,7 @@ class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
 	fresh_login: bool = False
+	error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,7 +202,9 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+async def launch_login_context(
+	settings: BrowserLoginSettings, *, use_proxy: bool = False
+) -> BrowserContext | _EphemeralBrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -226,7 +229,8 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		from cloakbrowser import launch_persistent_context_async
 
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
-		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		context: BrowserContext = await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		return context
 
 	from cloakbrowser import launch_async
 
@@ -296,7 +300,9 @@ async def wait_for_site_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS
 		print(f'[INFO] Dismissed {closed} popup dialog(s)')
 
 
-async def _wait_for_optional_load_state(page: Page, state: str, timeout_ms: int) -> bool:
+async def _wait_for_optional_load_state(
+	page: Page, state: Literal['domcontentloaded', 'load', 'networkidle'], timeout_ms: int
+) -> bool:
 	try:
 		await page.wait_for_load_state(state, timeout=timeout_ms)
 		return True
@@ -752,13 +758,39 @@ async def submit_login_form(page: Page, timeout_ms: int) -> None:
 				continue
 	if not submit:
 		raise TimeoutError(f'Cannot find submit button: {SUBMIT_SELECTORS}')
+	login_response = None
+
+	def on_response(response) -> None:
+		nonlocal login_response
+		if response.url.split('?', 1)[0].endswith('/api/user/login') and response.request.method == 'POST':
+			login_response = response
+
+	page.on('response', on_response)
 	try:
-		await submit.click(timeout=action_timeout)
-	except Exception:
-		await submit.click(force=True, timeout=action_timeout)
-	await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
-	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
-	await wait_for_logged_in(page, SESSION_WAIT_TIMEOUT_MS)
+		try:
+			await submit.click(timeout=action_timeout)
+		except Exception:
+			await submit.click(force=True, timeout=action_timeout)
+		await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
+		await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
+		if login_response is not None:
+			if login_response.status >= 400:
+				raise RuntimeError(f'登录接口返回 HTTP {login_response.status}')
+			try:
+				payload = await login_response.json()
+			except ValueError as exc:
+				raise RuntimeError('登录接口返回了非 JSON 响应') from exc
+			if not isinstance(payload, dict):
+				raise RuntimeError('登录接口响应格式异常')
+			if payload.get('success') is False:
+				raise RuntimeError(f'登录被拒绝：{payload.get("message") or "服务端未说明原因"}')
+			data = payload.get('data')
+			if isinstance(data, dict) and data.get('require_2fa'):
+				raise RuntimeError('账号需要二步验证')
+		if not await wait_for_logged_in(page, SESSION_WAIT_TIMEOUT_MS):
+			raise RuntimeError('提交登录后未进入控制台')
+	finally:
+		page.remove_listener('response', on_response)
 
 
 async def login_with_email_form(
