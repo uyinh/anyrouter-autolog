@@ -13,7 +13,8 @@ on:
 
 jobs:
   checkin:
-    runs-on: ubuntu-latest
+    # 钉在 24.04：26.04 新镜像存在 ubuntu 源 DNS 解析故障
+    runs-on: ubuntu-24.04
     environment: production
     env:
       PYTHONIOENCODING: utf-8
@@ -45,6 +46,8 @@ jobs:
         echo "✅ 环境初始化完成"
 
     - name: 安装系统依赖
+      # runner 偶发 DNS 故障不阻断签到；xvfb 等核心依赖已内置，字体缺失仅影响渲染
+      continue-on-error: true
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
