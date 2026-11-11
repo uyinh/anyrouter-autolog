@@ -7,8 +7,8 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import random
+import sys
 from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -36,11 +36,11 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
+from utils.headers import get_browser_headers
 from utils.notify import notify
+from utils.oauth_agentrouter import AgentRouterOAuthClient
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
-from utils.headers import get_browser_headers
-from utils.oauth_agentrouter import AgentRouterOAuthClient
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
@@ -189,6 +189,7 @@ async def login_with_credentials(
 			account_name=account_name,
 		)
 
+		fresh_login = False
 		if not await is_logged_in(page):
 			if await has_session_cookie(page):
 				print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
@@ -201,6 +202,7 @@ async def login_with_credentials(
 				provider=provider_name,
 				account_name=account_name,
 			)
+			fresh_login = True
 		else:
 			print(f'[INFO] {account_name}: Browser profile already logged in')
 
@@ -227,7 +229,7 @@ async def login_with_credentials(
 			success_msg += f', api_user={api_user}'
 		print(success_msg)
 		await context.close()
-		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, fresh_login=fresh_login)
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error during login: {e}')
@@ -368,6 +370,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	# 邮箱密码优先
 	all_cookies = None
 	resolved_api_user: str | None = None
+	fresh_login = False
 	auth_method = None
 	if account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
@@ -382,6 +385,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
+			fresh_login = login_result.fresh_login
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
@@ -413,6 +417,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		provider_config,
 		api_user_override=resolved_api_user,
 		use_proxy=provider_config.use_proxy,
+		fresh_login=fresh_login,
 	)
 
 
@@ -500,6 +505,7 @@ async def run_agentrouter_oauth_checkin(
 		print(f'[FAILED] {account_name}: OAuth check-in error: {e}')
 		return False, None, None
 
+
 def run_check_in_requests(
 	all_cookies: dict,
 	account: AccountConfig,
@@ -508,6 +514,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
+	fresh_login: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
@@ -542,9 +549,17 @@ def run_check_in_requests(
 				return success, user_info_before, user_info_after
 
 			if provider_config.name == 'agentrouter':
-				print(f'[WARN] {account_name}: AgentRouter 签到奖励在登录鉴权时由服务端发放（官方 FAQ：需要退出后重新登录才会到账）。')
+				if fresh_login:
+					if user_info_before and user_info_before.get('success'):
+						print(f'[SUCCESS] {account_name}: AgentRouter 邮箱密码重新登录完成，已验证用户信息')
+						return True, user_info_before, user_info_before
+					print(f'[FAILED] {account_name}: AgentRouter 重新登录后无法验证用户信息')
+					return False, user_info_before, user_info_before
+				print(
+					f'[WARN] {account_name}: AgentRouter 签到奖励在登录鉴权时由服务端发放（官方 FAQ：需要退出后重新登录才会到账）。'
+				)
 				print(f'[WARN] {account_name}: 当前仅提供了静态 Session Cookie，未触发登录事件，额度不会增长。')
-				print(f'[HINT] {account_name}: 请在账号配置中添加 "github_session" 或 "linuxdo_session" 以自动签到。')
+				print(f'[HINT] {account_name}: 请配置邮箱密码或 OAuth 会话，并使用新的登录会话执行签到。')
 				return False, user_info_before, user_info_before
 
 			user_info_after = get_user_info(client, headers, user_info_url)

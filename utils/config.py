@@ -98,7 +98,7 @@ class AppConfig:
 				name='agentrouter',
 				domain='https://agentrouter.org',
 				login_path='/login',
-				sign_in_path=None,  # 无需签到接口，查询用户信息时自动完成签到
+				sign_in_path=None,  # 登录时由服务端发放奖励
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
@@ -157,6 +157,7 @@ class AccountConfig:
 	password: str | None = None
 	github_session: str | None = None
 	linuxdo_session: str | None = None
+
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
 		"""从字典创建 AccountConfig"""
@@ -226,12 +227,15 @@ def load_accounts_config() -> list[AccountConfig] | None:
 			has_oauth = bool(
 				account_dict.get('github_session')
 				or account_dict.get('linuxdo_session')
-				or (isinstance(account_dict.get('cookies'), dict) and (
-					account_dict['cookies'].get('user_session')
-					or account_dict['cookies'].get('github_session')
-					or account_dict['cookies'].get('_forum_session')
-					or account_dict['cookies'].get('linuxdo_session')
-				))
+				or (
+					isinstance(account_dict.get('cookies'), dict)
+					and (
+						account_dict['cookies'].get('user_session')
+						or account_dict['cookies'].get('github_session')
+						or account_dict['cookies'].get('_forum_session')
+						or account_dict['cookies'].get('linuxdo_session')
+					)
+				)
 			)
 
 			if 'api_user' not in account_dict:
