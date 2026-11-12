@@ -360,7 +360,10 @@ def format_check_in_notification(detail: dict) -> str:
 
 	balance_info = after if after.get('success') else before if not detail['success'] else {}
 	balance = f'{balance_info["quota"]:.2f}' if balance_info.get('success') else '未知'
-	return f'{name}：{status}，{change} · 余额 {balance}'
+	result = f'{status}，{change}'
+	if detail['success'] and (change == '增量未知' or after.get('checkin_status') == 'already_checked_in'):
+		result = '今日已签到'
+	return f'{name}：{result} · 余额 {balance}'
 
 
 def format_check_in_report(results: list[dict], execution_time: datetime | None = None) -> str:
