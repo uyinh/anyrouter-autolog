@@ -342,30 +342,25 @@ def summarize_failure_reason(error: Exception | str, *, sensitive_values: tuple[
 
 
 def format_check_in_notification(detail: dict) -> str:
-	"""每个账号一行，仅根据接口结果说明登录、签到和余额。"""
+	"""每个账号一行，显示结果、实际额度变化和可查询余额。"""
 	name = detail['name']
-	if not detail['success']:
-		return f'❌ {name}：{summarize_failure_reason(detail["error"])}'
 	after = detail['after'] or {}
-	status = after.get('checkin_status', 'completed')
-	labels = {
-		'login_verified': '登录已验证',
-		'checkin_completed': '签到完成',
-		'already_checked_in': '今日已签到',
-		'reward_received': '服务端已发奖',
-		'balance_verified': '余额已查询',
-		'completed': '处理完成',
-	}
-	parts = [f'✅ {name}：{labels[status]}']
-	if after.get('success'):
-		parts.append(f'余额 ${after["quota"]:.2f}')
-		before = detail['before']
-		if before and before.get('success'):
-			quota_change = round(after['quota'] + after['used_quota'] - before['quota'] - before['used_quota'], 2)
-			if quota_change:
-				label = '奖励' if status == 'reward_received' and quota_change > 0 else '总额度变化'
-				parts.append(f'{label} {quota_change:+.2f} 美元')
-	return ' · '.join(parts)
+	before = detail['before'] or {}
+	if detail['success']:
+		status = '签到成功'
+	else:
+		status = '登录失败' if after.get('checkin_status') == 'login_failed' else '签到失败'
+
+	change = '增量未知'
+	if before.get('success') and after.get('success'):
+		quota_change = round(after['quota'] + after['used_quota'] - before['quota'] - before['used_quota'], 2) or 0
+		change = f'{quota_change:+.2f}'.rstrip('0').rstrip('.')
+	elif not detail['success'] or after.get('checkin_status') == 'already_checked_in':
+		change = '+0'
+
+	balance_info = after if after.get('success') else before if not detail['success'] else {}
+	balance = f'{balance_info["quota"]:.2f}' if balance_info.get('success') else '未知'
+	return f'{name}：{status}，{change} · 余额 {balance}'
 
 
 def format_check_in_report(results: list[dict], execution_time: datetime | None = None) -> str:
@@ -414,24 +409,32 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			error = login_result.error if login_result else '邮箱密码登录失败'
-			return False, None, {'success': False, 'error': error}
+			return False, None, {'success': False, 'error': error, 'checkin_status': 'login_failed'}
 	elif account.provider == 'agentrouter' and account.has_oauth_session():
 		print(f'[INFO] {account_name}: Attempting OAuth silent re-login for AgentRouter...')
 		user_cookies = parse_cookies(account.cookies)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		if not all_cookies:
-			return False, None, {'success': False, 'error': '无法获取站点验证 Cookie'}
+			return False, None, {'success': False, 'error': '无法获取站点验证 Cookie', 'checkin_status': 'login_failed'}
 		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
-			return False, None, {'success': False, 'error': '账号 Cookie 配置为空或格式错误'}
+			return (
+				False,
+				None,
+				{
+					'success': False,
+					'error': '账号 Cookie 配置为空或格式错误',
+					'checkin_status': 'login_failed',
+				},
+			)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
-		return False, None, {'success': False, 'error': '无法获取有效登录会话'}
+		return False, None, {'success': False, 'error': '无法获取有效登录会话', 'checkin_status': 'login_failed'}
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
@@ -453,6 +456,8 @@ async def run_agentrouter_oauth_checkin(
 	provider_config,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""通过 AgentRouter 的 OAuth 静默授权重登录流程完成真实签到。"""
+	user_info_before = None
+	failure_status = 'login_failed'
 	try:
 		proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
 		oauth_client = AgentRouterOAuthClient(domain=provider_config.domain)
@@ -499,7 +504,15 @@ async def run_agentrouter_oauth_checkin(
 				)
 			else:
 				print(f'[FAILED] {account_name}: Missing OAuth session token')
-				return False, user_info_before, {'success': False, 'error': '缺少 OAuth 会话'}
+				return (
+					False,
+					user_info_before,
+					{
+						'success': False,
+						'error': '缺少 OAuth 会话',
+						'checkin_status': 'login_failed',
+					},
+				)
 
 			# 3. 回调登录发奖
 			success, user_data, checked_in, msg = oauth_client.callback_login(
@@ -511,7 +524,16 @@ async def run_agentrouter_oauth_checkin(
 
 			if not success:
 				print(f'[FAILED] {account_name}: OAuth login callback failed - {msg}')
-				return False, user_info_before, {'success': False, 'error': f'OAuth 登录失败：{msg}'}
+				return (
+					False,
+					user_info_before,
+					{
+						'success': False,
+						'error': f'OAuth 登录失败：{msg}',
+						'checkin_status': 'login_failed',
+					},
+				)
+			failure_status = 'checkin_failed'
 
 			uid = str(user_data.get('id') or '')
 			if uid:
@@ -530,7 +552,7 @@ async def run_agentrouter_oauth_checkin(
 	except Exception as e:
 		error = summarize_failure_reason(e)
 		print(f'[FAILED] {account_name}: OAuth check-in error: {error}')
-		return False, None, {'success': False, 'error': error}
+		return False, user_info_before, {'success': False, 'error': error, 'checkin_status': failure_status}
 
 
 def run_check_in_requests(
@@ -544,6 +566,7 @@ def run_check_in_requests(
 	fresh_login: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
+	user_info_before = None
 	try:
 		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
 		proxy_url = get_proxy_server(use_proxy=use_proxy)
@@ -583,13 +606,21 @@ def run_check_in_requests(
 						print(f'[SUCCESS] {account_name}: AgentRouter 邮箱密码重新登录完成，已验证用户信息')
 						return True, None, {**user_info_before, 'checkin_status': 'login_verified'}
 					print(f'[FAILED] {account_name}: AgentRouter 重新登录后无法验证用户信息')
-					return False, user_info_before, user_info_before
+					return False, user_info_before, {**(user_info_before or {}), 'checkin_status': 'login_failed'}
 				print(
 					f'[WARN] {account_name}: AgentRouter 签到奖励在登录鉴权时由服务端发放（官方 FAQ：需要退出后重新登录才会到账）。'
 				)
 				print(f'[WARN] {account_name}: 当前仅提供了静态 Session Cookie，未触发登录事件，额度不会增长。')
 				print(f'[HINT] {account_name}: 请配置邮箱密码或 OAuth 会话，并使用新的登录会话执行签到。')
-				return False, user_info_before, {'success': False, 'error': '需要重新登录，当前复用了旧会话'}
+				return (
+					False,
+					user_info_before,
+					{
+						'success': False,
+						'error': '需要重新登录，当前复用了旧会话',
+						'checkin_status': 'login_failed',
+					},
+				)
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
@@ -602,7 +633,7 @@ def run_check_in_requests(
 	except Exception as e:
 		error = summarize_failure_reason(e)
 		print(f'[FAILED] {account_name}: {error}')
-		return False, None, {'success': False, 'error': error}
+		return False, user_info_before, {'success': False, 'error': error}
 
 
 async def main():
@@ -651,7 +682,7 @@ async def main():
 			success, before, after = False, None, None
 			error = summarize_failure_reason(exc)
 		results.append(
-			{'name': account.get_display_name(i), 'success': success, 'before': before, 'after': after, 'error': error}
+			{'name': account.name or f'{i + 1}号', 'success': success, 'before': before, 'after': after, 'error': error}
 		)
 		if after and after.get('success'):
 			current_balances[f'account_{i + 1}'] = {'quota': after['quota'], 'used': after['used_quota']}
