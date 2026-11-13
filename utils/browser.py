@@ -387,15 +387,21 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 		probe = await page.evaluate(_SLIDER_PROBE_JS)
 	except Exception:  # nosec B110
 		return False
-	if not probe or not probe.get('track') or not probe.get('knob'):
-		debug_print(f'[WARN] WAF slider not found: {probe}')
+	if not probe or not probe.get('track'):
+		debug_print(f'[WARN] WAF slider track not found: {probe}')
 		return False
 
 	track = probe['track']
-	knob = probe['knob']
-	start_x = knob['x'] + knob['width'] / 2
-	start_y = knob['y'] + knob['height'] / 2
-	end_x = track['x'] + track['width'] - knob['width'] / 2 - 3
+	knob = probe.get('knob')
+	knob_size = knob['width'] if knob else track['height']
+	if knob:
+		start_x = knob['x'] + knob['width'] / 2
+		start_y = knob['y'] + knob['height'] / 2
+	else:
+		# 滑块固定在轨道左端，找不到元素时用轨道左侧中心作为起点
+		start_x = track['x'] + knob_size / 2
+		start_y = track['y'] + track['height'] / 2
+	end_x = track['x'] + track['width'] - knob_size / 2 - 3
 	distance = end_x - start_x
 	if distance <= 10:
 		debug_print(f'[WARN] WAF slider distance too small: {distance:.1f}')
