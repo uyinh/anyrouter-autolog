@@ -6,6 +6,7 @@ import asyncio
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -381,6 +382,90 @@ async def _settle_page(page: Page, delay_seconds: float, networkidle_timeout_ms:
 	await _wait_for_optional_load_state(page, 'networkidle', networkidle_timeout_ms)
 
 
+def _xtest_available() -> bool:
+	return sys.platform.startswith('linux') and bool(os.getenv('DISPLAY'))
+
+
+async def _xtest_drag(page: Page, start_x: float, start_y: float, end_x: float) -> bool:
+	"""通过 X11 XTEST 发送真实鼠标事件，避开合成事件检测。"""
+	try:
+		from Xlib import X, display
+		from Xlib.ext import xtest
+	except ImportError:  # nosec B110
+		return False
+
+	try:
+		geometry = await page.evaluate(
+			"""() => ({
+				screenX: window.screenX,
+				screenY: window.screenY,
+				uiHeight: window.outerHeight - window.innerHeight,
+				dpr: window.devicePixelRatio || 1,
+			})"""
+		)
+	except Exception:  # nosec B110
+		return False
+
+	dpr = geometry.get('dpr') or 1
+	offset_x = geometry['screenX'] / dpr
+	offset_y = (geometry['screenY'] + geometry['uiHeight']) / dpr
+	sx = offset_x + start_x
+	sy = offset_y + start_y
+	ex = offset_x + end_x
+	debug_print(f'[INFO] XTEST drag ({sx:.0f},{sy:.0f}) -> ({ex:.0f},{sy:.0f})')
+
+	try:
+		disp = display.Display()
+	except Exception as exc:  # nosec B110
+		debug_print(f'[WARN] Cannot open X display: {exc}')
+		return False
+
+	try:
+		await page.bring_to_front()
+
+		def move(x: float, y: float) -> None:
+			xtest.fake_input(disp, X.MotionNotify, x=int(round(x)), y=int(round(y)))
+			disp.sync()
+
+		def button(pressed: bool) -> None:
+			xtest.fake_input(disp, X.ButtonPress if pressed else X.ButtonRelease, 1)
+			disp.sync()
+
+		move(sx, sy)
+		await asyncio.sleep(0.2)
+		button(True)
+		steps = 32
+		for index in range(1, steps + 1):
+			progress = index / steps
+			eased = 1 - (1 - progress) ** 2
+			move(sx + (ex - sx) * eased + random.uniform(-1.2, 1.2), sy + random.uniform(-1.5, 1.5))
+			await asyncio.sleep(random.uniform(0.008, 0.022))
+		move(ex, sy)
+		await asyncio.sleep(random.uniform(0.1, 0.3))
+		button(False)
+	finally:
+		disp.close()
+	return True
+
+
+async def _playwright_drag(page: Page, start_x: float, start_y: float, end_x: float) -> None:
+	await page.mouse.move(start_x, start_y)
+	await asyncio.sleep(random.uniform(0.15, 0.35))
+	await page.mouse.down()
+	steps = 32
+	for index in range(1, steps + 1):
+		progress = index / steps
+		eased = 1 - (1 - progress) ** 2
+		await page.mouse.move(
+			start_x + (end_x - start_x) * eased + random.uniform(-1.2, 1.2),
+			start_y + random.uniform(-1.5, 1.5),
+		)
+		await asyncio.sleep(random.uniform(0.008, 0.022))
+	await page.mouse.move(end_x, start_y)
+	await asyncio.sleep(random.uniform(0.1, 0.3))
+	await page.mouse.up()
+
+
 async def _try_pass_waf_slider(page: Page) -> bool:
 	"""拖动阿里云 WAF 滑块到轨道末端，通过后返回 True。"""
 	try:
@@ -408,21 +493,9 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 		return False
 
 	debug_print(f'[INFO] Dragging WAF slider {distance:.0f}px')
-	await page.mouse.move(start_x, start_y)
-	await asyncio.sleep(random.uniform(0.15, 0.35))
-	await page.mouse.down()
-	steps = 32
-	for index in range(1, steps + 1):
-		progress = index / steps
-		eased = 1 - (1 - progress) ** 2
-		await page.mouse.move(
-			start_x + distance * eased + random.uniform(-1.2, 1.2),
-			start_y + random.uniform(-1.5, 1.5),
-		)
-		await asyncio.sleep(random.uniform(0.008, 0.022))
-	await page.mouse.move(end_x, start_y)
-	await asyncio.sleep(random.uniform(0.1, 0.3))
-	await page.mouse.up()
+	dragged = await _xtest_drag(page, start_x, start_y, end_x) if _xtest_available() else False
+	if not dragged:
+		await _playwright_drag(page, start_x, start_y, end_x)
 	try:
 		await page.wait_for_load_state('domcontentloaded', timeout=10_000)
 	except Exception:  # nosec B110
