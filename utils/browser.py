@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -105,6 +106,50 @@ _WAF_VERIFICATION_JS = f"""() => {{
 	const text = (document.body?.innerText || '').slice(0, 600);
 	return {_WAF_TEXT_JS}.test(title + ' ' + text);
 }}"""
+
+_SLIDER_PROBE_JS = """() => {
+	const isVisible = (el) => {
+		if (!el || !el.isConnected) return false;
+		const s = window.getComputedStyle(el);
+		if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+		const r = el.getBoundingClientRect();
+		return r.width > 0 && r.height > 0;
+	};
+	const box = (el) => {
+		const r = el.getBoundingClientRect();
+		return {x: r.x, y: r.y, width: r.width, height: r.height};
+	};
+	const all = [...document.querySelectorAll('div,span,a,button,section')].filter(isVisible);
+	let track = null;
+	const hint = all.find((el) => /please slide to verify|slide to verify/i.test(el.textContent || ''));
+	if (hint) {
+		let node = hint;
+		while (node && node !== document.body) {
+			const r = node.getBoundingClientRect();
+			if (r.width >= 120 && r.width <= 900 && r.height >= 24 && r.height <= 120) {
+				track = node;
+				break;
+			}
+			node = node.parentElement;
+		}
+	}
+	if (!track) {
+		track = all.find((el) => {
+			const r = el.getBoundingClientRect();
+			return r.width >= 120 && r.width <= 900 && r.height >= 24 && r.height <= 120
+				&& /nc_|slide|slider|verify|captcha/i.test((el.className || '') + ' ' + (el.id || ''));
+		}) || null;
+	}
+	if (!track) return null;
+	const knobs = [...track.querySelectorAll('*')]
+		.filter(isVisible)
+		.map((el) => ({el, r: el.getBoundingClientRect()}))
+		.filter((o) => o.r.width >= 18 && o.r.width <= 90 && o.r.height >= 18 && o.r.height <= 90)
+		.sort((a, b) => a.r.x - b.r.x);
+	return {track: box(track), knob: knobs[0] ? box(knobs[0].el) : null};
+}"""
+
+_WAF_SLIDER_MAX_ATTEMPTS = 2
 
 
 class WafVerificationError(RuntimeError):
@@ -334,13 +379,61 @@ async def _settle_page(page: Page, delay_seconds: float, networkidle_timeout_ms:
 	await _wait_for_optional_load_state(page, 'networkidle', networkidle_timeout_ms)
 
 
+async def _try_pass_waf_slider(page: Page) -> bool:
+	"""拖动阿里云 WAF 滑块到轨道末端，通过后返回 True。"""
+	try:
+		probe = await page.evaluate(_SLIDER_PROBE_JS)
+	except Exception:  # nosec B110
+		return False
+	if not probe or not probe.get('track') or not probe.get('knob'):
+		debug_print(f'[WARN] WAF slider not found: {probe}')
+		return False
+
+	track = probe['track']
+	knob = probe['knob']
+	start_x = knob['x'] + knob['width'] / 2
+	start_y = knob['y'] + knob['height'] / 2
+	end_x = track['x'] + track['width'] - knob['width'] / 2 - 3
+	distance = end_x - start_x
+	if distance <= 10:
+		debug_print(f'[WARN] WAF slider distance too small: {distance:.1f}')
+		return False
+
+	debug_print(f'[INFO] Dragging WAF slider {distance:.0f}px')
+	await page.mouse.move(start_x, start_y)
+	await asyncio.sleep(random.uniform(0.15, 0.35))
+	await page.mouse.down()
+	steps = 32
+	for index in range(1, steps + 1):
+		progress = index / steps
+		eased = 1 - (1 - progress) ** 2
+		await page.mouse.move(
+			start_x + distance * eased + random.uniform(-1.2, 1.2),
+			start_y + random.uniform(-1.5, 1.5),
+		)
+		await asyncio.sleep(random.uniform(0.008, 0.022))
+	await page.mouse.move(end_x, start_y)
+	await asyncio.sleep(random.uniform(0.1, 0.3))
+	await page.mouse.up()
+	await asyncio.sleep(2)
+	try:
+		return not await page.evaluate(_WAF_VERIFICATION_JS)
+	except Exception:  # nosec B110：验证通过后页面会跳转
+		return True
+
+
 async def _wait_for_login_shell(page: Page, timeout_ms: int) -> bool:
-	"""轮询登录页状态，命中 WAF 验证页立即失败。"""
+	"""轮询登录页状态，命中 WAF 验证页时先尝试拖动滑块。"""
 	deadline = time.monotonic() + min(timeout_ms, _LOGIN_SHELL_TIMEOUT_MS) / 1000
 	while time.monotonic() < deadline:
 		try:
 			if await page.evaluate(_WAF_VERIFICATION_JS):
-				raise WafVerificationError('WAF 滑块验证：登录页被拦截')
+				for _ in range(_WAF_SLIDER_MAX_ATTEMPTS):
+					if await _try_pass_waf_slider(page):
+						break
+				else:
+					raise WafVerificationError('WAF 滑块验证：自动拖动未通过')
+				continue
 			if await page.evaluate(_LOGIN_SHELL_READY_JS):
 				return True
 		except WafVerificationError:
