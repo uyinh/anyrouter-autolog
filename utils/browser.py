@@ -173,6 +173,12 @@ _MOUSE_PROBE_JS = """() => {
 }"""
 
 
+_SLIDER_X_JS = """() => {
+	const el = document.querySelector('.aliyunCaptcha-sliding-slider, .slider-move');
+	return el ? Math.round(el.getBoundingClientRect().x) : null;
+}"""
+
+
 class WafVerificationError(RuntimeError):
 	"""登录页命中 WAF 滑块验证，当前出口 IP 被拦截。"""
 
@@ -451,17 +457,25 @@ async def _xtest_drag(page: Page, start_x: float, start_y: float, end_x: float) 
 			xtest.fake_input(disp, X.ButtonPress if pressed else X.ButtonRelease, 1)
 			disp.sync()
 
+		before = await page.evaluate(_SLIDER_X_JS)
 		warp(sx, sy)
 		await asyncio.sleep(0.2)
 		button(True)
-		steps = 32
+		steps = 48
 		for index in range(1, steps + 1):
 			progress = index / steps
-			eased = 1 - (1 - progress) ** 2
-			warp(sx + (ex - sx) * eased + random.uniform(-1.2, 1.2), sy + random.uniform(-1.5, 1.5))
-			await asyncio.sleep(random.uniform(0.008, 0.022))
-		warp(ex, sy)
-		await asyncio.sleep(random.uniform(0.1, 0.3))
+			if progress < 0.15:
+				eased = progress / 0.15 * 0.25
+			elif progress < 0.8:
+				eased = 0.25 + (progress - 0.15) / 0.65 * 0.6
+			else:
+				eased = 0.85 + (progress - 0.8) / 0.2 * 0.15
+			warp(sx + (ex - sx) * eased + random.uniform(-2.5, 2.5), sy + random.uniform(-3, 3))
+			await asyncio.sleep(random.uniform(0.012, 0.045))
+		warp(ex + random.uniform(-1.5, 1.5), sy + random.uniform(-1, 1))
+		await asyncio.sleep(random.uniform(0.25, 0.45))
+		after = await page.evaluate(_SLIDER_X_JS)
+		debug_print(f'[INFO] Slider x: {before} -> {after}')
 		button(False)
 	finally:
 		disp.close()
