@@ -157,7 +157,15 @@ _WAF_SLIDER_MAX_ATTEMPTS = 2
 _MOUSE_PROBE_JS = """() => {
 	window.__checkinMouse = [];
 	const record = (e) => {
-		window.__checkinMouse.push([e.type, Math.round(e.clientX), Math.round(e.clientY), e.isTrusted]);
+		window.__checkinMouse.push([
+			e.type,
+			Math.round(e.clientX),
+			Math.round(e.clientY),
+			e.isTrusted,
+			e.buttons,
+			e.target.tagName,
+			String(e.target.className).slice(0, 60),
+		]);
 	};
 	for (const type of ['mousemove', 'mousedown', 'mouseup']) {
 		document.addEventListener(type, record, true);
@@ -506,6 +514,16 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 
 	debug_print(f'[INFO] Dragging WAF slider {distance:.0f}px')
 	try:
+		hit = await page.evaluate(
+			f"""() => {{
+				const el = document.elementFromPoint({start_x}, {start_y});
+				return el ? [el.tagName, String(el.className).slice(0, 80)] : null;
+			}}"""
+		)
+		debug_print(f'[INFO] Slider start element: {hit}')
+	except Exception:  # nosec B110
+		pass
+	try:
 		await page.evaluate(_MOUSE_PROBE_JS)
 	except Exception:  # nosec B110
 		pass
@@ -513,7 +531,16 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 	if not dragged:
 		await _playwright_drag(page, start_x, start_y, end_x)
 	try:
-		events = await page.evaluate('() => (window.__checkinMouse || []).slice(-8)')
+		events = await page.evaluate(
+			"""() => {
+				const all = window.__checkinMouse || [];
+				return {
+					total: all.length,
+					down: all.filter((e) => e[0] === 'mousedown').slice(-2),
+					tail: all.slice(-3),
+				};
+			}"""
+		)
 		debug_print(f'[INFO] Mouse events: {events}')
 	except Exception:  # nosec B110
 		pass
