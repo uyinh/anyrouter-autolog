@@ -154,6 +154,16 @@ _SLIDER_PROBE_JS = """() => {
 
 _WAF_SLIDER_MAX_ATTEMPTS = 2
 
+_MOUSE_PROBE_JS = """() => {
+	window.__checkinMouse = [];
+	const record = (e) => {
+		window.__checkinMouse.push([e.type, Math.round(e.clientX), Math.round(e.clientY), e.isTrusted]);
+	};
+	for (const type of ['mousemove', 'mousedown', 'mouseup']) {
+		document.addEventListener(type, record, true);
+	}
+}"""
+
 
 class WafVerificationError(RuntimeError):
 	"""登录页命中 WAF 滑块验证，当前出口 IP 被拦截。"""
@@ -493,9 +503,18 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 		return False
 
 	debug_print(f'[INFO] Dragging WAF slider {distance:.0f}px')
+	try:
+		await page.evaluate(_MOUSE_PROBE_JS)
+	except Exception:  # nosec B110
+		pass
 	dragged = await _xtest_drag(page, start_x, start_y, end_x) if _xtest_available() else False
 	if not dragged:
 		await _playwright_drag(page, start_x, start_y, end_x)
+	try:
+		events = await page.evaluate('() => (window.__checkinMouse || []).slice(-8)')
+		debug_print(f'[INFO] Mouse events: {events}')
+	except Exception:  # nosec B110
+		pass
 	try:
 		await page.wait_for_load_state('domcontentloaded', timeout=10_000)
 	except Exception:  # nosec B110
