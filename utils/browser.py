@@ -397,32 +397,12 @@ def _xtest_available() -> bool:
 
 
 async def _xtest_drag(page: Page, start_x: float, start_y: float, end_x: float) -> bool:
-	"""通过 X11 XTEST 发送真实鼠标事件，避开合成事件检测。"""
+	"""通过 X11 XTEST 发送真实鼠标事件，坐标用页面事件实时标定。"""
 	try:
 		from Xlib import X, display
 		from Xlib.ext import xtest
 	except ImportError:  # nosec B110
 		return False
-
-	try:
-		geometry = await page.evaluate(
-			"""() => ({
-				screenX: window.screenX,
-				screenY: window.screenY,
-				uiHeight: window.outerHeight - window.innerHeight,
-				dpr: window.devicePixelRatio || 1,
-			})"""
-		)
-	except Exception:  # nosec B110
-		return False
-
-	dpr = geometry.get('dpr') or 1
-	offset_x = geometry['screenX'] / dpr
-	offset_y = (geometry['screenY'] + geometry['uiHeight']) / dpr
-	sx = offset_x + start_x
-	sy = offset_y + start_y
-	ex = offset_x + end_x
-	debug_print(f'[INFO] XTEST drag ({sx:.0f},{sy:.0f}) -> ({ex:.0f},{sy:.0f})')
 
 	try:
 		disp = display.Display()
@@ -433,24 +413,46 @@ async def _xtest_drag(page: Page, start_x: float, start_y: float, end_x: float) 
 	try:
 		await page.bring_to_front()
 
-		def move(x: float, y: float) -> None:
+		def warp(x: float, y: float) -> None:
 			xtest.fake_input(disp, X.MotionNotify, x=int(round(x)), y=int(round(y)))
 			disp.sync()
+
+		await page.evaluate(_MOUSE_PROBE_JS)
+		warp(200, 200)
+		await asyncio.sleep(0.35)
+		first = await page.evaluate('() => (window.__checkinMouse || []).slice(-1)[0]')
+		warp(700, 600)
+		await asyncio.sleep(0.35)
+		second = await page.evaluate('() => (window.__checkinMouse || []).slice(-1)[0]')
+		if not first or not second or first[1] == second[1] or first[2] == second[2]:
+			debug_print(f'[WARN] XTEST calibration failed: {first} {second}')
+			return False
+
+		scale_x = (700 - 200) / (second[1] - first[1])
+		scale_y = (600 - 200) / (second[2] - first[2])
+		offset_x = 200 - first[1] * scale_x
+		offset_y = 200 - first[2] * scale_y
+		debug_print(f'[INFO] XTEST scale=({scale_x:.2f},{scale_y:.2f}) offset=({offset_x:.0f},{offset_y:.0f})')
+
+		sx = offset_x + start_x * scale_x
+		sy = offset_y + start_y * scale_y
+		ex = offset_x + end_x * scale_x
+		debug_print(f'[INFO] XTEST drag ({sx:.0f},{sy:.0f}) -> ({ex:.0f},{sy:.0f})')
 
 		def button(pressed: bool) -> None:
 			xtest.fake_input(disp, X.ButtonPress if pressed else X.ButtonRelease, 1)
 			disp.sync()
 
-		move(sx, sy)
+		warp(sx, sy)
 		await asyncio.sleep(0.2)
 		button(True)
 		steps = 32
 		for index in range(1, steps + 1):
 			progress = index / steps
 			eased = 1 - (1 - progress) ** 2
-			move(sx + (ex - sx) * eased + random.uniform(-1.2, 1.2), sy + random.uniform(-1.5, 1.5))
+			warp(sx + (ex - sx) * eased + random.uniform(-1.2, 1.2), sy + random.uniform(-1.5, 1.5))
 			await asyncio.sleep(random.uniform(0.008, 0.022))
-		move(ex, sy)
+		warp(ex, sy)
 		await asyncio.sleep(random.uniform(0.1, 0.3))
 		button(False)
 	finally:
