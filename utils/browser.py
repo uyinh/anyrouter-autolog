@@ -67,10 +67,17 @@ _VISIBLE_CHECK_JS = """
 	const countVisible = (selector) => [...document.querySelectorAll(selector)].filter(isVisible).length;
 """
 
+_WAF_TEXT_JS = (
+	r'/Access Verification|slide to verify|Please slide|请进行验证|'
+	r'为了更好的访问体验|访问受限|Access denied|verify you are human/i'
+)
+
+_LOGIN_SHELL_TIMEOUT_MS = 30_000
+
 _SITE_READY_JS = f"""() => {{
 {_VISIBLE_CHECK_JS}
 	const text = document.body?.innerText || '';
-	const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human/i.test(text);
+	const blocked = {_WAF_TEXT_JS}.test(text);
 	if (blocked) return false;
 	const wafBlockers = document.querySelector(
 		'iframe[src*="captcha"], iframe[src*="verify"], iframe[src*="slide"], .nc-container, #nocaptcha'
@@ -88,10 +95,21 @@ _SITE_READY_JS = f"""() => {{
 _LOGIN_SHELL_READY_JS = f"""() => {{
 {_VISIBLE_CHECK_JS}
 	const text = document.body?.innerText || '';
-	const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human/i.test(text);
+	const blocked = {_WAF_TEXT_JS}.test(text);
 	if (blocked) return false;
 	return countVisible('.semi-card') > 0 || countVisible('#username') > 0 || countVisible('button') >= 2;
 }}"""
+
+_WAF_VERIFICATION_JS = f"""() => {{
+	const title = document.title || '';
+	const text = (document.body?.innerText || '').slice(0, 600);
+	return {_WAF_TEXT_JS}.test(title + ' ' + text);
+}}"""
+
+
+class WafVerificationError(RuntimeError):
+	"""登录页命中 WAF 滑块验证，当前出口 IP 被拦截。"""
+
 
 _OPEN_EMAIL_FORM_JS = """() => {
 	const isVisible = (el) => {
@@ -317,12 +335,20 @@ async def _settle_page(page: Page, delay_seconds: float, networkidle_timeout_ms:
 
 
 async def _wait_for_login_shell(page: Page, timeout_ms: int) -> bool:
-	shell_timeout = min(timeout_ms, 60_000)
-	try:
-		await page.wait_for_function(_LOGIN_SHELL_READY_JS, timeout=shell_timeout)
-		return True
-	except Exception:  # nosec B110
-		return False
+	"""轮询登录页状态，命中 WAF 验证页立即失败。"""
+	deadline = time.monotonic() + min(timeout_ms, _LOGIN_SHELL_TIMEOUT_MS) / 1000
+	while time.monotonic() < deadline:
+		try:
+			if await page.evaluate(_WAF_VERIFICATION_JS):
+				raise WafVerificationError('WAF 滑块验证：登录页被拦截')
+			if await page.evaluate(_LOGIN_SHELL_READY_JS):
+				return True
+		except WafVerificationError:
+			raise
+		except Exception:  # nosec B110：页面跳转中 evaluate 会短暂失败
+			pass
+		await asyncio.sleep(1)
+	return False
 
 
 async def navigate_login_page(
@@ -355,10 +381,16 @@ async def navigate_login_page(
 		await page.goto(login_url, wait_until='load', timeout=attempt_timeout)
 		await _settle_page(page, 5, 20_000)
 
-		if await _wait_for_login_shell(page, attempt_timeout):
-			await wait_for_site_ready(page, timeout_ms)
-			if await page.evaluate(_LOGIN_SHELL_READY_JS):
-				return
+		try:
+			if await _wait_for_login_shell(page, attempt_timeout):
+				await wait_for_site_ready(page, timeout_ms)
+				if await page.evaluate(_LOGIN_SHELL_READY_JS):
+					return
+		except WafVerificationError:
+			await _log_login_page_state(page)
+			if provider and account_name:
+				await save_login_screenshot(page, provider, account_name, f'waf-verification-{attempt + 1}')
+			raise
 
 		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}')
 		await _log_login_page_state(page)
@@ -613,7 +645,7 @@ async def _log_login_page_state(page: Page) -> None:
 			};
 		}"""
 	)
-	debug_print(f'[INFO] Login page state: {state}')
+	print(f'[WARN] Login page state: {state}')
 
 
 async def _open_email_login_form(

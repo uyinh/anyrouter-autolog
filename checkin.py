@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from utils.browser import (
 	BrowserLoginResult,
+	WafVerificationError,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
@@ -328,6 +329,8 @@ def summarize_failure_reason(error: Exception | str, *, sensitive_values: tuple[
 			message = message.replace(value, '***')
 	if 'Login page never rendered' in message:
 		return '登录页面未加载完成'
+	if isinstance(error, WafVerificationError) or 'WAF 滑块验证' in message:
+		return 'WAF 滑块验证'
 	if any(text in message for text in ('Cannot find', 'Cannot open email login form')):
 		return '登录表单未就绪'
 	if isinstance(error, (httpx.TimeoutException, TimeoutError)) or 'Timeout' in message:
@@ -348,6 +351,8 @@ def format_check_in_notification(detail: dict) -> str:
 	before = detail['before'] or {}
 	if detail['success']:
 		status = '签到成功'
+	elif 'WAF 滑块验证' in (detail.get('error') or ''):
+		status = 'WAF 验证拦截'
 	else:
 		status = '登录失败' if after.get('checkin_status') == 'login_failed' else '签到失败'
 

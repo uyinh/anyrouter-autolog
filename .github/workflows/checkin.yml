@@ -63,7 +63,7 @@ jobs:
       id: cloakbrowser-cache
       with:
         path: ~/.cloakbrowser
-        key: ${{ runner.os }}-cloakbrowser-v1
+        key: ${{ runner.os }}-cloakbrowser-v2
         restore-keys: |
           ${{ runner.os }}-cloakbrowser-
 
@@ -95,8 +95,9 @@ jobs:
       env:
         CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
         PROXY_SUBSCRIPTION_URL: ${{ secrets.PROXY_SUBSCRIPTION_URL }}
-        PROXY_TEST_URL: https://www.google.com/generate_204
+        PROXY_TEST_URL: https://agentrouter.org/login
         DIRECT_PROXY_TEST_URL: https://agentrouter.org
+        PROXY_MAX_PROBES: 5
         MIHOMO_VERSION: v1.19.27
         PROXY_REQUIRED: false
       run: bash scripts/setup_mihomo_proxy.sh
