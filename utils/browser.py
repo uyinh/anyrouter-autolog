@@ -121,12 +121,13 @@ _SLIDER_PROBE_JS = """() => {
 	};
 	const all = [...document.querySelectorAll('div,span,a,button,section')].filter(isVisible);
 	let track = null;
-	const hint = all.find((el) => /please slide to verify|slide to verify/i.test(el.textContent || ''));
+	const hints = all.filter((el) => /please slide to verify|slide to verify/i.test(el.textContent || ''));
+	const hint = hints[hints.length - 1];
 	if (hint) {
-		let node = hint;
+		let node = hint.parentElement;
 		while (node && node !== document.body) {
 			const r = node.getBoundingClientRect();
-			if (r.width >= 120 && r.width <= 900 && r.height >= 24 && r.height <= 120) {
+			if (r.width >= 150 && r.width <= 600 && r.height >= 24 && r.height <= 100) {
 				track = node;
 				break;
 			}
@@ -136,15 +137,16 @@ _SLIDER_PROBE_JS = """() => {
 	if (!track) {
 		track = all.find((el) => {
 			const r = el.getBoundingClientRect();
-			return r.width >= 120 && r.width <= 900 && r.height >= 24 && r.height <= 120
+			return r.width >= 150 && r.width <= 600 && r.height >= 24 && r.height <= 100
 				&& /nc_|slide|slider|verify|captcha/i.test((el.className || '') + ' ' + (el.id || ''));
 		}) || null;
 	}
 	if (!track) return null;
+	const trackHeight = track.getBoundingClientRect().height;
 	const knobs = [...track.querySelectorAll('*')]
 		.filter(isVisible)
 		.map((el) => ({el, r: el.getBoundingClientRect()}))
-		.filter((o) => o.r.width >= 18 && o.r.width <= 90 && o.r.height >= 18 && o.r.height <= 90)
+		.filter((o) => o.r.width >= 18 && o.r.width <= 90 && o.r.height >= Math.max(18, trackHeight * 0.5) && o.r.height <= 90)
 		.sort((a, b) => a.r.x - b.r.x);
 	return {track: box(track), knob: knobs[0] ? box(knobs[0].el) : null};
 }"""
@@ -415,6 +417,10 @@ async def _try_pass_waf_slider(page: Page) -> bool:
 	await page.mouse.move(end_x, start_y)
 	await asyncio.sleep(random.uniform(0.1, 0.3))
 	await page.mouse.up()
+	try:
+		await page.wait_for_load_state('domcontentloaded', timeout=10_000)
+	except Exception:  # nosec B110
+		pass
 	await asyncio.sleep(2)
 	try:
 		return not await page.evaluate(_WAF_VERIFICATION_JS)
@@ -459,6 +465,18 @@ async def navigate_login_page(
 	base_url = f'{parsed.scheme}://{parsed.netloc}/'
 	attempt_timeout = min(timeout_ms, 60_000)
 
+	failed_requests: list[str] = []
+
+	def on_bad_response(response) -> None:
+		if response.status >= 400:
+			failed_requests.append(f'{response.status} {response.url[:150]}')
+
+	def on_request_failed(request) -> None:
+		failed_requests.append(f'FAILED {request.url[:150]}')
+
+	page.on('response', on_bad_response)
+	page.on('requestfailed', on_request_failed)
+
 	try:
 		print(f'[INFO] Warming up {base_url} before login')
 		await page.goto(base_url, wait_until='load', timeout=attempt_timeout)
@@ -481,12 +499,16 @@ async def navigate_login_page(
 					return
 		except WafVerificationError:
 			await _log_login_page_state(page)
+			if failed_requests:
+				print(f'[WARN] Failed requests: {failed_requests[-8:]}')
 			if provider and account_name:
 				await save_login_screenshot(page, provider, account_name, f'waf-verification-{attempt + 1}')
 			raise
 
 		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}')
 		await _log_login_page_state(page)
+		if failed_requests:
+			print(f'[WARN] Failed requests: {failed_requests[-8:]}')
 		if provider and account_name:
 			await save_login_screenshot(page, provider, account_name, f'login-shell-attempt-{attempt + 1}')
 		if attempt < 2:
